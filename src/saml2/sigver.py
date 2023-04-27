@@ -854,6 +854,91 @@ class CryptoBackendXmlSec1(CryptoBackend):
             return p_out, p_err, ntf.read()
 
 
+class CryptoBackendLibXMLSec(CryptoBackend):
+    """
+    CryptoBackend implementation using xmlsec package to sign and verify
+    XML documents.
+
+    Encrypt and decrypt is currently unsupported.
+    """
+
+    def __init__(self, **kwargs):
+        CryptoBackend.__init__(self, **kwargs)
+
+        try:
+            self.non_xml_crypto = RSACrypto(kwargs["rsa_key"])
+        except KeyError:
+            pass
+
+    def version(self):
+        # XXX if XMLSecurity.__init__ included a __version__, that would be
+        # better than static 0.0 here.
+        return "xmlsec 0.0"
+
+    def sign_statement(self, statement, node_name, key_file, node_id):
+        """
+        Sign an XML statement.
+
+        The parameters actually used in this CryptoBackend
+        implementation are :
+
+        :param statement: XML as string
+        :param node_name: Name of the node to sign
+        :param key_file: xmlsec key_spec string(), filename,
+            'pkcs11://' URI or PEM data
+        :returns: Signed XML as string
+        """
+        from lxml import etree
+        import xmlsec
+
+        if isinstance(statement, SamlBase):
+            statement = str(statement)
+
+        xml = etree.fromstring(statement)
+        signature_node = xmlsec.tree.find_node(xml, xmlsec.constants.NodeSignature)
+        ctx = xmlsec.SignatureContext()
+        ctx.key = xmlsec.Key.from_file(key_file, xmlsec.constants.KeyDataFormatPem, None)
+        ctx.key.name = key_file
+        ctx.sign(signature_node)
+
+        signed_str = etree.tostring(signed, xml_declaration=False, encoding="UTF-8")
+        if not isinstance(signed_str, str):
+            signed_str = signed_str.decode("utf-8")
+        return signed_str
+
+    def validate_signature(self, signedtext, cert_file, cert_type, node_name, node_id):
+        """
+        Validate signature on XML document.
+
+        The parameters actually used in this CryptoBackend
+        implementation are :
+
+        :param signedtext: The signed XML data as string
+        :param cert_file: xmlsec key_spec string(), filename,
+            'pkcs11://' URI or PEM data
+        :param cert_type: string, must be 'pem' for now
+        :returns: True on successful validation, False otherwise
+        """
+        if cert_type != "pem":
+            raise Unsupported("Only PEM certs supported here")
+
+        from lxml import etree
+        import xmlsec
+
+        xml = etree.fromstring(signedtext)
+        xmlsec.tree.add_ids(xml, node_name)
+
+        if node_id:
+            xml = xml.find(".//*[@ID='" + node_id + "']")
+
+        try:
+            ctx = xmlsec.SignatureContext()
+            ctx.key = xmlsec.Key.from_file(cert_file, xmlsec.constants.KeyDataFormatCertPem)
+            return ctx.verify(xml)
+        except xmlsec.Error:
+            return False
+
+
 class CryptoBackendXMLSecurity(CryptoBackend):
     """
     CryptoBackend implementation using pyXMLSecurity to sign and verify
@@ -971,6 +1056,18 @@ def security_context(conf):
     elif conf.crypto_backend == "XMLSecurity":
         # new and somewhat untested pyXMLSecurity crypto backend.
         crypto = CryptoBackendXMLSecurity()
+    elif conf.crypto_backend == "libxmlsec":
+        crypto = CryptoBackendLibXMLSec()
+
+        _file_name = conf.getattr("key_file", "")
+        if _file_name:
+            try:
+                rsa_key = import_rsa_key_from_file(_file_name)
+            except Exception as err:
+                logger.error(f"Cannot import key from {_file_name}: {err}")
+                raise
+            else:
+                sec_backend = RSACrypto(rsa_key)
     else:
         err_msg = "Unknown crypto_backend {backend}"
         err_msg = err_msg.format(backend=conf.crypto_backend)
